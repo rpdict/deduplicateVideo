@@ -2,7 +2,9 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/csv"
 	"encoding/hex"
 	"encoding/json"
@@ -12,8 +14,11 @@ import (
 	"io"
 	"io/fs"
 	"log"
+	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 	"sync"
@@ -41,6 +46,14 @@ type Config struct {
 	SampleChunkBytes    int64
 	KeepDuplicateCopies bool
 	CopyMode            bool
+	Step                string
+	PlanJSONPath        string
+	PlanCSVPath         string
+	ConfirmMove         bool
+	EnableAI            bool
+	FrameOutputDir      string
+	PromptPath          string
+	EnvMinConfidence    float64
 	UnknownProvince     string
 	UnknownCity         string
 	OllamaURL           string
@@ -86,6 +99,24 @@ type Report struct {
 	Errors           []string          `json:"errors"`
 	DuplicateRecords []DuplicateRecord `json:"duplicate_records"`
 	OrganizedRecords []OrganizeRecord  `json:"organized_records"`
+}
+
+type MovePlan struct {
+	GeneratedAt string         `json:"generated_at"`
+	InputDir    string         `json:"input_dir"`
+	OutputDir   string         `json:"output_dir"`
+	Items       []MovePlanItem `json:"items"`
+}
+
+type MovePlanItem struct {
+	SourcePath string `json:"source_path"`
+	DestPath   string `json:"dest_path"`
+	Action     string `json:"action"`
+	Approved   bool   `json:"approved"`
+	Reason     string `json:"reason"`
+	Environment string `json:"environment"`
+	Confidence  float64 `json:"confidence"`
+	FramePath   string `json:"frame_path"`
 }
 
 type hashJob struct {
@@ -202,6 +233,7 @@ func (p *progressBar) render(final bool) {
 
 // main 作为程序入口，执行参数解析、主流程运行与报告写入。
 func main() {
+	ensureUTF8Console()
 	cfg, err := parseFlags()
 	if err != nil {
 		log.Fatalf("参数错误: %v", err)
@@ -224,6 +256,16 @@ func main() {
 		report.TotalScanned, report.TotalUniqueKept, report.TotalDuplicates, time.Since(start).String())
 }
 
+func ensureUTF8Console() {
+	if runtime.GOOS != "windows" {
+		return
+	}
+	cmd := exec.Command("cmd", "/c", "chcp", "65001")
+	cmd.Stdout = io.Discard
+	cmd.Stderr = io.Discard
+	_ = cmd.Run()
+}
+
 // parseFlags 读取并校验命令行参数。
 func parseFlags() (Config, error) {
 	var cfg Config
@@ -235,6 +277,14 @@ func parseFlags() (Config, error) {
 	flag.Int64Var(&cfg.SampleChunkBytes, "sampleChunkBytes", 65536, "抽样块字节数")
 	flag.BoolVar(&cfg.KeepDuplicateCopies, "keepDuplicateCopies", false, "是否保留重复副本到输出")
 	flag.BoolVar(&cfg.CopyMode, "copyMode", true, "true复制,false移动")
+	flag.StringVar(&cfg.Step, "step", "plan", "执行步骤: plan 或 move")
+	flag.StringVar(&cfg.PlanJSONPath, "planJson", "", "规划文件JSON路径")
+	flag.StringVar(&cfg.PlanCSVPath, "planCsv", "", "规划文件CSV路径")
+	flag.BoolVar(&cfg.ConfirmMove, "confirmMove", true, "计划生成后是否等待确认再移动")
+	flag.BoolVar(&cfg.EnableAI, "enableAI", false, "是否启用AI识别环境")
+	flag.StringVar(&cfg.FrameOutputDir, "frameDir", "", "抽帧输出目录")
+	flag.StringVar(&cfg.PromptPath, "promptPath", "", "AI识别提示词路径")
+	flag.Float64Var(&cfg.EnvMinConfidence, "envMinConfidence", 0.6, "环境识别置信度阈值")
 	flag.StringVar(&cfg.UnknownProvince, "unknownProvince", "待分类", "未知省份目录名")
 	flag.StringVar(&cfg.UnknownCity, "unknownCity", "未知城市", "未知城市目录名")
 	flag.StringVar(&cfg.OllamaURL, "ollamaURL", "http://localhost:11434/", "本地Ollama地址")
@@ -256,6 +306,12 @@ func parseFlags() (Config, error) {
 	if cfg.MaxSizeDiffRatio < 0 || cfg.MaxSizeDiffRatio > 1 {
 		return cfg, errors.New("maxSizeDiffRatio 必须在0到1之间")
 	}
+	if cfg.EnvMinConfidence < 0 || cfg.EnvMinConfidence > 1 {
+		return cfg, errors.New("envMinConfidence 必须在0到1之间")
+	}
+	if cfg.Step != "plan" && cfg.Step != "move" {
+		return cfg, errors.New("step 必须为 plan 或 move")
+	}
 
 	absInput, err := filepath.Abs(cfg.InputDir)
 	if err != nil {
@@ -267,11 +323,48 @@ func parseFlags() (Config, error) {
 	}
 	cfg.InputDir = absInput
 	cfg.OutputDir = absOutput
+	if cfg.PlanJSONPath == "" {
+		cfg.PlanJSONPath = filepath.Join(cfg.OutputDir, "move_plan.json")
+	}
+	if cfg.PlanCSVPath == "" {
+		cfg.PlanCSVPath = filepath.Join(cfg.OutputDir, "move_plan.csv")
+	}
+	if cfg.FrameOutputDir == "" {
+		cfg.FrameOutputDir = filepath.Join(cfg.OutputDir, "_frames")
+	}
+	if cfg.PromptPath == "" {
+		if cwd, err := os.Getwd(); err == nil {
+			cfg.PromptPath = filepath.Join(cwd, "configs", "prompts", "video_frame_recognition_prompt.md")
+		}
+	}
+	if cfg.EnableAI {
+		if _, err := os.Stat(cfg.PromptPath); err != nil {
+			return cfg, fmt.Errorf("promptPath 不存在: %s", cfg.PromptPath)
+		}
+		if _, err := exec.LookPath("ffmpeg"); err != nil {
+			return cfg, errors.New("未找到 ffmpeg，可通过安装 ffmpeg 并加入 PATH 后再启用AI")
+		}
+	}
 	return cfg, nil
 }
 
 // run 串联扫描、摘要、去重、归类与报告数据组装。
 func run(cfg Config) (Report, error) {
+	if cfg.Step == "move" {
+		plan, err := readMovePlan(cfg.PlanJSONPath)
+		if err != nil {
+			return Report{}, err
+		}
+		errs := executeMovePlan(cfg, plan.Items)
+		report := Report{
+			GeneratedAt: time.Now().Format(time.RFC3339),
+			InputDir:    cfg.InputDir,
+			OutputDir:   cfg.OutputDir,
+		}
+		report.Errors = append(report.Errors, errs...)
+		return report, nil
+	}
+
 	paths, infos, walkErrs := scanVideoFiles(cfg.InputDir)
 	otherPaths, otherScanErrs := scanNonVideoFiles(cfg.InputDir)
 	files, hashErrs := buildVideoFiles(cfg, paths, infos)
@@ -291,13 +384,26 @@ func run(cfg Config) (Report, error) {
 	report.TotalDuplicates = len(dupRecords)
 	report.TotalUniqueKept = len(kept)
 
-	orgRecords, orgErrs := organize(cfg, kept, dupRecords)
-	report.OrganizedRecords = orgRecords
-	report.Errors = append(report.Errors, orgErrs...)
+	plan, planErrs := buildMovePlan(cfg, kept, dupRecords, otherPaths)
+	report.Errors = append(report.Errors, planErrs...)
+	if err := writeMovePlanJSON(cfg.PlanJSONPath, plan); err != nil {
+		report.Errors = append(report.Errors, err.Error())
+	}
+	if err := writeMovePlanCSV(cfg.PlanCSVPath, plan.Items); err != nil {
+		report.Errors = append(report.Errors, err.Error())
+	}
 
-	otherRecords, otherOrgErrs := organizeNonVideoFiles(cfg, otherPaths)
-	report.OrganizedRecords = append(report.OrganizedRecords, otherRecords...)
-	report.Errors = append(report.Errors, otherOrgErrs...)
+	if cfg.ConfirmMove {
+		if confirmMove() {
+			for i := range plan.Items {
+				plan.Items[i].Approved = true
+			}
+			_ = writeMovePlanJSON(cfg.PlanJSONPath, plan)
+			_ = writeMovePlanCSV(cfg.PlanCSVPath, plan.Items)
+			errs := executeMovePlan(cfg, plan.Items)
+			report.Errors = append(report.Errors, errs...)
+		}
+	}
 
 	return report, nil
 }
@@ -358,6 +464,355 @@ func isVideoFile(name string) bool {
 	ext := strings.ToLower(filepath.Ext(name))
 	_, ok := videoExtSet[ext]
 	return ok
+}
+
+func buildMovePlan(cfg Config, kept []VideoFile, dups []DuplicateRecord, otherPaths []string) (MovePlan, []string) {
+	reserved := make(map[string]struct{})
+	items := make([]MovePlanItem, 0, len(kept)+len(otherPaths)+len(dups))
+	action := "copy"
+	if !cfg.CopyMode {
+		action = "move"
+	}
+	errs := make([]string, 0)
+
+	promptText := ""
+	if cfg.EnableAI {
+		if data, err := os.ReadFile(cfg.PromptPath); err == nil {
+			promptText = string(data)
+		} else {
+			errs = append(errs, fmt.Sprintf("读取提示词失败: %s: %v", cfg.PromptPath, err))
+		}
+	}
+	if cfg.EnableAI && strings.TrimSpace(promptText) == "" {
+		errs = append(errs, fmt.Sprintf("提示词内容为空: %s", cfg.PromptPath))
+	}
+
+	frames := make(map[string]string)
+	aiResults := make(map[string]AIResult)
+	if cfg.EnableAI {
+		if err := ensureDir(cfg.FrameOutputDir); err == nil {
+			var frameErrs []string
+			frames, frameErrs = extractVideoFrames(cfg, kept)
+			errs = append(errs, frameErrs...)
+			if len(frames) == 0 && len(kept) > 0 {
+				errs = append(errs, "未生成任何视频帧，AI识别未执行")
+			}
+			var aiErrs []string
+			aiResults, aiErrs = recognizeEnvironments(cfg, frames, promptText)
+			errs = append(errs, aiErrs...)
+		} else {
+			errs = append(errs, fmt.Sprintf("创建抽帧目录失败: %s: %v", cfg.FrameOutputDir, err))
+		}
+	}
+
+	for _, f := range kept {
+		destDir := targetVideoDir(cfg, f)
+		if cfg.EnableAI {
+			if env, ok := aiResults[f.Path]; ok && env.Environment != "" && env.Environment != "unknown" && env.Confidence >= cfg.EnvMinConfidence {
+				destDir = filepath.Join(destDir, env.Environment)
+			}
+		}
+		destPath, err := planUniqueDestPath(reserved, destDir, filepath.Base(f.Path))
+		if err != nil {
+			continue
+		}
+		framePath := frames[f.Path]
+		env := aiResults[f.Path]
+		items = append(items, MovePlanItem{
+			SourcePath: f.Path,
+			DestPath:   destPath,
+			Action:     action,
+			Approved:   false,
+			Reason:     "keep_video",
+			Environment: env.Environment,
+			Confidence:  env.Confidence,
+			FramePath:   framePath,
+		})
+	}
+
+	if cfg.KeepDuplicateCopies {
+		dupDir := filepath.Join(cfg.OutputDir, "_duplicates")
+		for _, d := range dups {
+			destPath, err := planUniqueDestPath(reserved, dupDir, filepath.Base(d.OriginalPath))
+			if err != nil {
+				continue
+			}
+			items = append(items, MovePlanItem{
+				SourcePath: d.OriginalPath,
+				DestPath:   destPath,
+				Action:     "copy",
+				Approved:   false,
+				Reason:     "duplicate_copy",
+			})
+		}
+	}
+
+	for _, src := range otherPaths {
+		rel, err := filepath.Rel(cfg.InputDir, src)
+		if err != nil {
+			continue
+		}
+		destPath := filepath.Join(cfg.OutputDir, rel)
+		destDir := filepath.Dir(destPath)
+		destPath, err = planUniqueDestPath(reserved, destDir, filepath.Base(destPath))
+		if err != nil {
+			continue
+		}
+		items = append(items, MovePlanItem{
+			SourcePath: src,
+			DestPath:   destPath,
+			Action:     action,
+			Approved:   false,
+			Reason:     "non_video",
+		})
+	}
+
+	return MovePlan{
+		GeneratedAt: time.Now().Format(time.RFC3339),
+		InputDir:    cfg.InputDir,
+		OutputDir:   cfg.OutputDir,
+		Items:       items,
+	}, errs
+}
+
+type AIResult struct {
+	Environment string  `json:"environment"`
+	Confidence  float64 `json:"confidence"`
+	Summary     string  `json:"summary"`
+	Tags        []string `json:"tags"`
+}
+
+func extractVideoFrames(cfg Config, files []VideoFile) (map[string]string, []string) {
+	out := make(map[string]string, len(files))
+	errs := make([]string, 0)
+	bar := newProgressBar("视频抽帧", len(files))
+	defer bar.finish()
+	for _, f := range files {
+		bar.increment()
+		base := strings.TrimSuffix(filepath.Base(f.Path), filepath.Ext(f.Path))
+		framePath := filepath.Join(cfg.FrameOutputDir, base+".jpg")
+		if err := extractSingleFrame(cfg, f.Path, framePath); err != nil {
+			errs = append(errs, fmt.Sprintf("抽帧失败: %s: %v", f.Path, err))
+			continue
+		}
+		out[f.Path] = framePath
+	}
+	return out, errs
+}
+
+func extractSingleFrame(cfg Config, videoPath, framePath string) error {
+	if _, err := os.Stat(framePath); err == nil {
+		return nil
+	}
+	if err := ensureDir(filepath.Dir(framePath)); err != nil {
+		return err
+	}
+	cmd := []string{
+		"ffmpeg",
+		"-y",
+		"-i", videoPath,
+		"-vf", "scale=1280:720",
+		"-frames:v", "1",
+		framePath,
+	}
+	_, err := runExternal(cmd)
+	return err
+}
+
+func recognizeEnvironments(cfg Config, frames map[string]string, prompt string) (map[string]AIResult, []string) {
+	results := make(map[string]AIResult, len(frames))
+	errs := make([]string, 0)
+	bar := newProgressBar("环境识别", len(frames))
+	defer bar.finish()
+	for videoPath, framePath := range frames {
+		bar.increment()
+		res, err := callOllamaVision(cfg, prompt, framePath)
+		if err != nil {
+			errs = append(errs, fmt.Sprintf("识别失败: %s: %v", framePath, err))
+			continue
+		}
+		results[videoPath] = res
+	}
+	return results, errs
+}
+
+func callOllamaVision(cfg Config, prompt string, imagePath string) (AIResult, error) {
+	imageBytes, err := os.ReadFile(imagePath)
+	if err != nil {
+		return AIResult{}, err
+	}
+	payload := map[string]interface{}{
+		"model":  cfg.OllamaModel,
+		"prompt": prompt,
+		"stream": false,
+		"images": []string{base64.StdEncoding.EncodeToString(imageBytes)},
+	}
+	data, err := json.Marshal(payload)
+	if err != nil {
+		return AIResult{}, err
+	}
+	url := strings.TrimSuffix(cfg.OllamaURL, "/") + "/api/generate"
+	resp, err := http.Post(url, "application/json", bytes.NewReader(data))
+	if err != nil {
+		return AIResult{}, err
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return AIResult{}, err
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return AIResult{}, fmt.Errorf("ollama响应异常: %s", strings.TrimSpace(string(body)))
+	}
+	var raw struct {
+		Response string `json:"response"`
+	}
+	if err = json.Unmarshal(body, &raw); err != nil {
+		return AIResult{}, err
+	}
+	resText := strings.TrimSpace(raw.Response)
+	var result AIResult
+	if err = json.Unmarshal([]byte(resText), &result); err != nil {
+		return AIResult{}, err
+	}
+	return result, nil
+}
+
+func runExternal(cmd []string) (string, error) {
+	if len(cmd) == 0 {
+		return "", errors.New("空命令")
+	}
+	c := exec.Command(cmd[0], cmd[1:]...)
+	out, err := c.CombinedOutput()
+	return string(out), err
+}
+
+func planUniqueDestPath(reserved map[string]struct{}, dir, fileName string) (string, error) {
+	if err := ensureDir(dir); err != nil {
+		return "", err
+	}
+	ext := filepath.Ext(fileName)
+	base := strings.TrimSuffix(fileName, ext)
+	candidate := filepath.Join(dir, fileName)
+	if !isPathTaken(candidate, reserved) {
+		reserved[candidate] = struct{}{}
+		return candidate, nil
+	}
+	for i := 1; i <= 100000; i++ {
+		name := fmt.Sprintf("%s_%d%s", base, i, ext)
+		candidate = filepath.Join(dir, name)
+		if !isPathTaken(candidate, reserved) {
+			reserved[candidate] = struct{}{}
+			return candidate, nil
+		}
+	}
+	return "", errors.New("文件名冲突次数过多")
+}
+
+func isPathTaken(path string, reserved map[string]struct{}) bool {
+	if _, ok := reserved[path]; ok {
+		return true
+	}
+	if _, err := os.Stat(path); err == nil {
+		return true
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return true
+	}
+	return false
+}
+
+func writeMovePlanJSON(path string, plan MovePlan) error {
+	data, err := json.MarshalIndent(plan, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(path, data, 0o644)
+}
+
+func writeMovePlanCSV(path string, items []MovePlanItem) error {
+	f, err := os.Create(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	w := csv.NewWriter(f)
+	defer w.Flush()
+		if err = w.Write([]string{"source_path", "dest_path", "action", "approved", "reason", "environment", "confidence", "frame_path"}); err != nil {
+		return err
+	}
+	for _, item := range items {
+		row := []string{
+			item.SourcePath,
+			item.DestPath,
+			item.Action,
+			fmt.Sprintf("%t", item.Approved),
+			item.Reason,
+				item.Environment,
+				fmt.Sprintf("%.4f", item.Confidence),
+				item.FramePath,
+		}
+		if err = w.Write(row); err != nil {
+			return err
+		}
+	}
+	return w.Error()
+}
+
+func readMovePlan(path string) (MovePlan, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return MovePlan{}, err
+	}
+	var plan MovePlan
+	if err = json.Unmarshal(data, &plan); err != nil {
+		return MovePlan{}, err
+	}
+	return plan, nil
+}
+
+func executeMovePlan(cfg Config, items []MovePlanItem) []string {
+	errs := make([]string, 0)
+	bar := newProgressBar("文件移动", len(items))
+	defer bar.finish()
+	for _, item := range items {
+		bar.increment()
+		if !item.Approved {
+			continue
+		}
+		destDir := filepath.Dir(item.DestPath)
+		if err := ensureDir(destDir); err != nil {
+			errs = append(errs, fmt.Sprintf("创建目录失败: %s: %v", destDir, err))
+			continue
+		}
+		var err error
+		if item.Action == "copy" {
+			err = copyFile(item.SourcePath, item.DestPath)
+		} else {
+			err = moveFile(item.SourcePath, item.DestPath)
+		}
+		if err != nil {
+			errs = append(errs, fmt.Sprintf("执行失败: %s -> %s: %v", item.SourcePath, item.DestPath, err))
+		}
+	}
+	return errs
+}
+
+func confirmMove() bool {
+	reader := bufio.NewReader(os.Stdin)
+	for {
+		fmt.Print("\n已生成 move_plan.json 与 move_plan.csv，是否继续移动文件？(yes/no): ")
+		text, err := reader.ReadString('\n')
+		if err != nil && !errors.Is(err, io.EOF) {
+			return false
+		}
+		text = strings.TrimSpace(strings.ToLower(text))
+		if text == "y" || text == "yes" {
+			return true
+		}
+		if text == "" || text == "n" || text == "no" {
+			return false
+		}
+	}
 }
 
 // buildVideoFiles 并发计算视频摘要与路径归类信息。
